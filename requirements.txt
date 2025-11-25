@@ -1,7 +1,12 @@
 streamlit
 google-cloud-vision
 google-cloud-storage
+google-api-python-client
 google-auth
-gspread
-oauth2client
+google-auth-oauthlib
+google-auth-httplib2
+protobuf==3.20.3
+opencv-python-headless
 Pillow
+numpy
+requests
