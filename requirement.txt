@@ -1,0 +1,16 @@
+Google Vision + Google Sheets + Pandas + OpenCV + UI.
+
+streamlit
+pandas
+openpyxl
+requests
+google-cloud-vision
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+Pillow
+python-dotenv
+
+
+
