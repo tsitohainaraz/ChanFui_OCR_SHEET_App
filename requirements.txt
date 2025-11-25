@@ -1,0 +1,7 @@
+streamlit
+google-cloud-vision
+google-cloud-storage
+google-auth
+gspread
+oauth2client
+Pillow
