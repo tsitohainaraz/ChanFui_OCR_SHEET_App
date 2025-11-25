@@ -1,45 +1,32 @@
-###############################################################
-# CHANFUI — OCR FACTURE PRO (GOOGLE VISION + UI PREMIUM)
-# VERSION 2025 — FICHIER COMPLET (prêt à coller & exécuter)
-#
-# Remarques :
-# - Place les fichiers JSON de credentials (chanfuiocr-478317-46a916fc6992.json
-#   et Credentials.json) dans le même dossier que ce script.
-# - SAMPLE_IMAGE_PATH pointe vers l'exemple que tu as uploadé : /mnt/data/Teste.jpg
-###############################################################
+# app_streamlit_cloud.py
+# ChanFui OCR — Streamlit Cloud ready (no OpenCV, uses st.secrets for credentials)
+# - Keep your secrets in .streamlit/secrets.toml (see template at the end of this file)
+# - This file replaces cv2 preprocessing by PIL-based preprocessing and uses Google Vision
+# - Google Sheets coloration is preserved (uses googleapiclient)
 
 import streamlit as st
-import cv2
 import numpy as np
 import re
-import os
-import json
 import time
-from datetime import datetime, date
+import json
+import os
+from datetime import datetime
 from io import BytesIO
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
 from google.cloud import vision
+from google.oauth2.service_account import Credentials as SA_Credentials
 import gspread
-from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 import pandas as pd
 
 # ---------------------------
-# Config / chemins / constantes
+# Page config
 # ---------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Fichiers JSON (mets-les dans le même dossier)
-VISION_CREDENTIALS = os.path.join(BASE_DIR, "chanfuiocr-478317-46a916fc6992.json")
-SHEETS_CREDENTIALS = os.path.join(BASE_DIR, "Credentials.json")  # fallback local
-
-# Exemple d'image fournie (chemin local)
-SAMPLE_IMAGE_PATH = "/mnt/data/Teste.jpg"   # <-- fichier envoyé précédemment
-
 st.set_page_config(page_title="ChanFui OCR PRO", layout="centered", page_icon="🍷")
 
-SCAN_STATE_FILENAME = "scan_state.json"
-
+# ---------------------------
+# Constants & UI styles (same as your original)
+# ---------------------------
 COLORS = [
     {"red": 0.8, "green": 1.0, "blue": 0.8},
     {"red": 0.15, "green": 0.15, "blue": 0.15},
@@ -47,15 +34,12 @@ COLORS = [
 ]
 
 AUTHORIZED_USERS = {
-    "haina": "A1234",
-    "paul": "B5531",
-    "lina": "C9910",
-    "admin": "D2201"
+    "CFADMIN": "A1234",
+    "CFCOMERCIALE": "B5531",
+    "CFSTOCK": "C9910",
+    "CFDIRECTION": "D2201"
 }
 
-# ---------------------------
-# CSS UI
-# ---------------------------
 st.markdown("""
 <style>
 :root{
@@ -95,43 +79,38 @@ html, body, [data-testid='stAppViewContainer']{
 st.markdown("<div class='wine-title'>ChanFui & Fils </div><div class='wine-sub'>Google Vision Premium Edition</div>", unsafe_allow_html=True)
 
 # ---------------------------
-# Helpers - scan state
+# Session-state backed scan index (instead of local file)
 # ---------------------------
-APP_FOLDER = os.getcwd()
-
-def load_scan_state():
-    p = os.path.join(APP_FOLDER, SCAN_STATE_FILENAME)
-    if os.path.exists(p):
-        return json.load(open(p, "r", encoding="utf-8"))
-    return {"scan_index": 0}
-
-def save_scan_state(data):
-    p = os.path.join(APP_FOLDER, SCAN_STATE_FILENAME)
-    json.dump(data, open(p, "w", encoding="utf-8"))
-
-scan_state = load_scan_state()
+if "scan_index" not in st.session_state:
+    # try to initialize from optional scan_state in secrets for migration
+    try:
+        st.session_state.scan_index = int(st.secrets.get("SCAN_STATE", {}).get("scan_index", 0))
+    except Exception:
+        st.session_state.scan_index = 0
 
 # ---------------------------
 # Login
 # ---------------------------
+
 def do_logout():
     for k in ["auth", "user_nom", "user_matricule"]:
         if k in st.session_state:
             del st.session_state[k]
-    st.rerun()
+    st.experimental_rerun()
+
 
 def login_block():
     st.markdown("### 🔐 Connexion")
     nom = st.text_input("Nom")
     mat = st.text_input("Matricule", type="password")
     if st.button("Se connecter"):
-        if nom.lower() in AUTHORIZED_USERS and AUTHORIZED_USERS[nom.lower()] == mat:
+        if nom.upper() in AUTHORIZED_USERS and AUTHORIZED_USERS[nom.upper()] == mat:
             st.session_state.auth = True
             st.session_state.user_nom = nom
             st.session_state.user_matricule = mat
             st.success("Connexion OK")
             time.sleep(0.3)
-            st.rerun()
+            st.experimental_rerun()
         else:
             st.error("Accès refusé")
 
@@ -143,36 +122,58 @@ if not st.session_state.auth:
     st.stop()
 
 # ---------------------------
-# Preprocessing image
+# Image preprocessing (PIL-based, Cloud-friendly)
 # ---------------------------
-def preprocess_image(image_bytes):
-    npimg = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
 
-    # Denoise
-    img = cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
+def preprocess_image(image_bytes: bytes) -> bytes:
+    """
+    Replace OpenCV preprocessing with PIL-based operations:
+    - open image
+    - convert to RGB
+    - auto-contrast, median filter (denoise), sharpen, optional resize
+    - return JPEG bytes
+    """
+    img = Image.open(BytesIO(image_bytes)).convert("RGB")
 
-    # Contrast via LAB
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    l = cv2.equalizeHist(l)
-    img = cv2.merge((l, a, b))
-    img = cv2.cvtColor(img, cv2.COLOR_LAB2BGR)
+    # Optional resize to a max width to speed up processing (keeps aspect)
+    max_width = 2600
+    if img.width > max_width:
+        ratio = max_width / img.width
+        new_h = int(img.height * ratio)
+        img = img.resize((max_width, new_h), Image.LANCZOS)
 
-    # Sharpen
-    sharp = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    img = cv2.filter2D(img, -1, sharp)
+    # Auto contrast
+    img = ImageOps.autocontrast(img)
+    # Median filter for light denoise
+    img = img.filter(ImageFilter.MedianFilter(size=3))
+    # Slight sharpen
+    img = img.filter(ImageFilter.UnsharpMask(radius=1, percent=120, threshold=3))
 
-    _, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    return buf.tobytes()
+    # Save back to JPEG bytes
+    out = BytesIO()
+    img.save(out, format="JPEG", quality=90)
+    return out.getvalue()
 
 # ---------------------------
-# Google Vision OCR (explicit credentials)
+# Google Vision OCR using st.secrets
 # ---------------------------
-def google_vision_ocr(img_bytes):
-    if not os.path.exists(VISION_CREDENTIALS):
-        raise FileNotFoundError(f"Fichier de credentials Vision introuvable: {VISION_CREDENTIALS}")
-    client = vision.ImageAnnotatorClient.from_service_account_file(VISION_CREDENTIALS)
+
+def get_vision_client():
+    # support flexible secrets keys: 'gcp_vision' or 'gcp_sheet' or 'google_service_account'
+    if "gcp_vision" in st.secrets:
+        sa_info = dict(st.secrets["gcp_vision"])  # preferred
+    elif "google_service_account" in st.secrets:
+        sa_info = dict(st.secrets["google_service_account"])  # older template
+    else:
+        raise RuntimeError("Credentials Google Vision introuvables dans st.secrets (gcp_vision)")
+
+    creds = SA_Credentials.from_service_account_info(sa_info)
+    client = vision.ImageAnnotatorClient(credentials=creds)
+    return client
+
+
+def google_vision_ocr(img_bytes: bytes) -> str:
+    client = get_vision_client()
     image = vision.Image(content=img_bytes)
     response = client.text_detection(image=image)
     if response.error and response.error.message:
@@ -182,6 +183,10 @@ def google_vision_ocr(img_bytes):
         raw_text = response.text_annotations[0].description
     return raw_text or ""
 
+# ---------------------------
+# Text cleaning & extraction (same helpers)
+# ---------------------------
+
 def clean_text(text):
     text = text.replace("\r", "\n")
     text = text.replace("\n ", "\n")
@@ -190,9 +195,9 @@ def clean_text(text):
     text = re.sub(r"\s+\n", "\n", text)
     return text.strip()
 
-# ---------------------------
-# Extraction helpers
-# ---------------------------
+# Extraction helpers unchanged (copy your functions)
+# ... (we keep the same extraction helpers as in your original code)
+
 def extract_invoice_number(text):
     p = r"FACTURE\s+EN\s+COMPTE.*?N[°o]?\s*([0-9]{3,})"
     m = re.search(p, text, flags=re.I)
@@ -208,6 +213,7 @@ def extract_invoice_number(text):
         return m.group(1)
     return ""
 
+
 def extract_delivery_address(text):
     p = r"Adresse de livraison\s*[:\-]\s*(.+)"
     m = re.search(p, text, flags=re.I)
@@ -219,6 +225,7 @@ def extract_delivery_address(text):
         return m2.group(1).strip().split("\n")[0]
     return ""
 
+
 def extract_doit(text):
     p = r"\bDOIT\s*[:\-]?\s*([A-Z0-9]{2,6})"
     m = re.search(p, text, flags=re.I)
@@ -229,6 +236,7 @@ def extract_doit(text):
         if c in text:
             return c
     return ""
+
 
 def extract_month(text):
     months = {
@@ -242,6 +250,7 @@ def extract_month(text):
             return months[mname]
     return ""
 
+
 def extract_bon_commande(text):
     m = re.search(r"Suivant votre bon de commande\s*[:\-]?\s*([0-9A-Za-z\-\/]+)", text, flags=re.I)
     if m:
@@ -250,6 +259,7 @@ def extract_bon_commande(text):
     if m2:
         return m2.group(1).strip().split()[0]
     return ""
+
 
 def extract_items(text):
     items = []
@@ -273,11 +283,12 @@ def extract_items(text):
     return items
 
 # ---------------------------
-# Pipeline
+# Pipeline (uses PIL preprocess + Google Vision)
 # ---------------------------
-def invoice_pipeline(image_bytes):
-    clean_img = preprocess_image(image_bytes)
-    raw = google_vision_ocr(clean_img)
+
+def invoice_pipeline(image_bytes: bytes):
+    cleaned = preprocess_image(image_bytes)
+    raw = google_vision_ocr(cleaned)
     raw = clean_text(raw)
     return {
         "raw": raw,
@@ -290,43 +301,44 @@ def invoice_pipeline(image_bytes):
     }
 
 # ---------------------------
-# Google Sheets helpers
+# Google Sheets helpers (use secrets)
 # ---------------------------
+def _get_sheet_id():
+    # flexible lookup for sheet id
+    if "settings" in st.secrets and "sheet_id" in st.secrets["settings"]:
+        return st.secrets["settings"]["sheet_id"]
+    if "SHEET_ID" in st.secrets:
+        return st.secrets["SHEET_ID"]
+    raise KeyError("Mettez 'sheet_id' dans st.secrets['settings'] ou 'SHEET_ID' dans st.secrets")
+
+
 def get_worksheet():
-    creds_path = None
-    if "GCP_CREDENTIALS_PATH" in st.secrets:
-        creds_path = st.secrets["GCP_CREDENTIALS_PATH"]
-    elif os.path.exists(SHEETS_CREDENTIALS):
-        creds_path = SHEETS_CREDENTIALS
+    # prefer gcp_sheet, fallback to google_service_account
+    if "gcp_sheet" in st.secrets:
+        sa_info = dict(st.secrets["gcp_sheet"])
+    elif "google_service_account" in st.secrets:
+        sa_info = dict(st.secrets["google_service_account"])
     else:
-        raise FileNotFoundError("Credentials Google Sheets introuvable. Mettez st.secrets['GCP_CREDENTIALS_PATH'] ou Credentials.json dans le dossier.")
+        raise FileNotFoundError("Credentials Google Sheets introuvables dans st.secrets")
 
-    sheet_id = st.secrets.get("SHEET_ID", None)
-    if not sheet_id:
-        raise KeyError("Mettez 'SHEET_ID' dans st.secrets pour l'ID du Google Sheet.")
-
-    creds = Credentials.from_service_account_file(
-        creds_path,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(sheet_id)
+    client = gspread.service_account_from_dict(sa_info)
+    sheet_id = _get_sheet_id()
+    sh = client.open_by_key(sheet_id)
     return sh.sheet1
 
-def get_sheets_service():
-    creds_path = None
-    if "GCP_CREDENTIALS_PATH" in st.secrets:
-        creds_path = st.secrets["GCP_CREDENTIALS_PATH"]
-    elif os.path.exists(SHEETS_CREDENTIALS):
-        creds_path = SHEETS_CREDENTIALS
-    else:
-        raise FileNotFoundError("Credentials Google Sheets introuvable.")
 
-    creds = Credentials.from_service_account_file(
-        creds_path,
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    return build("sheets", "v4", credentials=creds)
+def get_sheets_service():
+    if "gcp_sheet" in st.secrets:
+        sa_info = dict(st.secrets["gcp_sheet"])
+    elif "google_service_account" in st.secrets:
+        sa_info = dict(st.secrets["google_service_account"])
+    else:
+        raise FileNotFoundError("Credentials Google Sheets introuvables dans st.secrets")
+
+    creds = SA_Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    service = build("sheets", "v4", credentials=creds)
+    return service
+
 
 def color_rows(spreadsheet_id, sheet_id, start, end, color):
     service = get_sheets_service()
@@ -345,44 +357,25 @@ def color_rows(spreadsheet_id, sheet_id, start, end, color):
             }
         ]
     }
-    service.spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body=body
-    ).execute()
+    service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
 
 # ---------------------------
-# UI - Upload / camera
+# UI - Upload (no camera as requested)
 # ---------------------------
-st.markdown("<br>", unsafe_allow_html=True)
 st.markdown("<div class='chancard'>", unsafe_allow_html=True)
-
 uploaded = st.file_uploader("Importer une facture (jpg/png)", type=["jpg","jpeg","png"])
-take = st.button("📸 Prendre une photo maintenant")
-
-camera_image = None
-if take:
-    st.info("Active la caméra puis capture.")
-    camera_image = st.camera_input("Photo")
-
 st.markdown("</div>", unsafe_allow_html=True)
 
 img = None
-if camera_image:
-    img = Image.open(camera_image)
-elif uploaded:
+if uploaded:
     img = Image.open(uploaded)
-else:
-    if os.path.exists(SAMPLE_IMAGE_PATH):
-        with st.expander("Exemple facture (démo)"):
-            st.image(SAMPLE_IMAGE_PATH, use_container_width=True)
 
-# session state for edited table
+# prepare edited df storage
 if "edited_articles_df" not in st.session_state:
     st.session_state["edited_articles_df"] = None
 
 if img:
     st.image(img, caption="Aperçu", use_container_width=True)
-
     buf = BytesIO()
     img.save(buf, format="JPEG")
     img_bytes = buf.getvalue()
@@ -405,11 +398,11 @@ if img:
     bon_commande_val = col1.text_input("📦 Suivant votre bon de commande", value=res.get("bon_commande", ""))
     adresse_val = col2.text_input("📍 Adresse de livraison", value=res.get("adresse", ""))
     doit_val = col2.text_input("👤 DOIT", value=res.get("doit", ""))
-    # mois as selectbox with detected default if available
-    month_detected = res.get("mois", "")
-    mois_val = col2.selectbox("📅 Mois", [""] + ["Janvier","Février","Mars","Avril","Mai","Juin","Juillet","Août","Septembre","Octobre","Novembre","Décembre"], index= (0 if not month_detected else ["","Janvier","Février","Mars","Avril","Mai","Juin","Juillet","Août","Septembre","Octobre","Novembre","Décembre"].index(month_detected)) )
 
-    # prepare articles df
+    month_detected = res.get("mois", "")
+    months_list = ["","Janvier","Février","Mars","Avril","Mai","Juin","Juillet","Août","Septembre","Octobre","Novembre","Décembre"]
+    mois_val = col2.selectbox("📅 Mois", months_list, index=(0 if not month_detected else months_list.index(month_detected)))
+
     detected_articles = res.get("articles", [])
     if not detected_articles:
         detected_articles = [{"article": "", "bouteilles": 0}]
@@ -422,7 +415,6 @@ if img:
     df_articles["bouteilles"] = pd.to_numeric(df_articles["bouteilles"].fillna(0), errors="coerce").fillna(0).astype(int)
 
     st.subheader("Articles détectés (modifiable)")
-
     edited_df = st.data_editor(
         df_articles,
         num_rows="dynamic",
@@ -433,75 +425,61 @@ if img:
         use_container_width=True
     )
 
-    # Add line button
     if st.button("➕ Ajouter une ligne"):
         new_row = pd.DataFrame([{"article": "", "bouteilles": 0}])
         edited_df = pd.concat([edited_df, new_row], ignore_index=True)
         st.session_state["edited_articles_df"] = edited_df
-        st.rerun()
+        st.experimental_rerun()
 
-    # store edited df
     st.session_state["edited_articles_df"] = edited_df.copy()
 
     st.subheader("Texte brut (résultat OCR)")
     st.code(res["raw"])
 
 # ---------------------------
-# Prepare worksheet (attempt, but non-blocking)
+# Prepare worksheet (attempt, non-blocking)
 # ---------------------------
 try:
     ws = get_worksheet()
     sheet_id = ws.id
-    spreadsheet_id = st.secrets.get("SHEET_ID", None)
+    spreadsheet_id = _get_sheet_id()
 except Exception as e:
     ws = None
     sheet_id = None
     spreadsheet_id = None
 
 # ---------------------------
-# ENVOI -> Google Sheets (format EXACT selon ton modèle)
+# ENVOI -> Google Sheets
 # ---------------------------
 if img and st.session_state.get("edited_articles_df") is not None and ws and st.button("📤 Envoyer vers Google Sheets"):
     try:
         edited = st.session_state["edited_articles_df"].copy()
-        # remove empty lines
         edited = edited[~((edited["article"].astype(str).str.strip() == "") & (edited["bouteilles"] == 0))]
         edited["bouteilles"] = pd.to_numeric(edited["bouteilles"].fillna(0), errors="coerce").fillna(0).astype(int)
 
-        # model columns:
-        # A MOIS | B DOIT | C Date | D Suivant votre bon de commande | E Adresse de livraison
-        # F Article | G Nb bouteilles | H editeur
-
-        # compute start row (1-based)
         start_row = len(ws.get_all_values()) + 1
-
-        # date string: use today
         today_str = datetime.now().strftime("%d/%m/%Y")
 
         for _, row in edited.iterrows():
             ws.append_row([
-                mois_val or "",                  # A
-                doit_val or "",                  # B
-                today_str,                       # C  (or use a date input if you prefer)
-                bon_commande_val or "",          # D
-                adresse_val or "",               # E
-                row.get("article", ""),          # F
-                int(row.get("bouteilles", 0)),   # G
-                st.session_state.user_nom        # H editor
+                mois_val or "",
+                doit_val or "",
+                today_str,
+                bon_commande_val or "",
+                adresse_val or "",
+                row.get("article", ""),
+                int(row.get("bouteilles", 0)),
+                st.session_state.user_nom
             ])
 
         end_row = len(ws.get_all_values())
 
-        # color rows (startRowIndex & endRowIndex are 0-based in API)
-        color = COLORS[scan_state["scan_index"] % len(COLORS)]
+        color = COLORS[st.session_state.get("scan_index", 0) % len(COLORS)]
         if spreadsheet_id and sheet_id is not None:
-            # start_row - 1 because API uses 0-index
             color_rows(spreadsheet_id, sheet_id, start_row-1, end_row, color)
 
-        scan_state["scan_index"] += 1
-        save_scan_state(scan_state)
+        st.session_state["scan_index"] = st.session_state.get("scan_index", 0) + 1
 
-        # Report
         st.success("✅ Données insérées avec succès !")
         st.info(f"📌 Lignes insérées dans le sheet : {start_row} → {end_row}")
         st.write("🧾 Récapitulatif envoyé :")
@@ -523,7 +501,6 @@ if img and st.session_state.get("edited_articles_df") is not None and ws and st.
 # ---------------------------
 if ws and st.button("👀 Aperçu du Google Sheet"):
     try:
-        # show first 200 rows to keep it responsive
         records = ws.get_all_records()
         df_sheet = pd.DataFrame(records)
         if df_sheet.shape[0] > 200:
@@ -539,3 +516,41 @@ if ws and st.button("👀 Aperçu du Google Sheet"):
 # ---------------------------
 st.markdown("---")
 st.button("🚪 Déconnexion", on_click=do_logout)
+
+
+# ---------------------------
+# requirements.txt (paste this into your requirements.txt file)
+# ---------------------------
+#
+# streamlit
+# pillow
+# numpy
+# google-cloud-vision
+# gspread
+# google-api-python-client
+# google-auth
+# pandas
+#
+
+# ---------------------------
+# .streamlit/secrets.toml TEMPLATE
+# ---------------------------
+#
+# [gcp_vision]
+# type = "service_account"
+# project_id = "chanfuiocr-478317"
+# private_key_id = "..."
+# private_key = """-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"""
+# client_email = "ocr-chanfui@chanfuiocr-478317.iam.gserviceaccount.com"
+# token_uri = "https://oauth2.googleapis.com/token"
+#
+# [gcp_sheet]
+# type = "service_account"
+# project_id = "chanfuishett"
+# private_key_id = "..."
+# private_key = """-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"""
+# client_email = "python-api-chanfui@chanfuishett.iam.gserviceaccount.com"
+# token_uri = "https://oauth2.googleapis.com/token"
+#
+# [settings]
+# sheet_id = "TON_GOOGLE_SHEET_KEY"
