@@ -34,10 +34,7 @@ COLORS = [
 ]
 
 AUTHORIZED_USERS = {
-    "CFADMIN": "A1234",
-    "CFCOMERCIALE": "B5531",
-    "CFSTOCK": "C9910",
-    "CFDIRECTION": "D2201"
+    "direction": "CF2025",
 }
 
 st.markdown("""
@@ -554,3 +551,4 @@ st.button("🚪 Déconnexion", on_click=do_logout)
 #
 # [settings]
 # sheet_id = "TON_GOOGLE_SHEET_KEY"
+
